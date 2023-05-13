@@ -26,6 +26,68 @@ from decorators import authenticated, is_premium
 from auth import get_profile, update_profile
 
 
+# ---------------------- HELPER FUNCTIONS ---------------------------- #
+
+def insert_dynamo(item):
+    # Reference: https://docs.python.org/3/library/time.html
+    try:
+        dynamo = boto3.resource('dynamodb')
+        # table = dynamo.Table('gaoyunl1_annotations')
+        table = dynamo.Table(app.config['AWS_DYNAMODB_ANNOTATIONS_TABLE'])
+        item['submit_time'] = int(time.time())
+        item['job_status'] = 'PENDING'
+        response = table.put_item(Item = item)
+        print(f'Dynamo resonse: {response}')
+    except ClientError as e:
+        app.logger.error(f"Client Error when inserting to DynamoDb: {e}") 
+    except Exception as e:
+        app.logger.error(f"Error when inserting to DynamoDb: {e}")
+
+def publish_to_sns(data):
+    # Reference: https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/sns/client/publish.html
+    try:
+        sns = boto3.client('sns', region_name=app.config['AWS_REGION_NAME'])
+        # topic_arn = 'arn:aws:sns:us-east-1:659248683008:gaoyunl1_job_requests'
+        topic_arn = app.config['AWS_SNS_JOB_REQUEST_TOPIC']
+        message = json.dumps(data)
+        subject = 'New Annotation Job Request'
+        response = sns.publish(TopicArn=topic_arn, Message=message, Subject=subject)
+        print(f'SNS response: {response}')
+        return response
+    except ClientError as e:
+        app.logger.error(f"Client Error when publishing to SNS: {e}")
+        raise
+    except Exception as e:
+        app.logger.error(f"Error when publishing to SNS: {e}")
+        raise
+
+def ephoch_to_readable_time(epoch):
+  return datetime.fromtimestamp(epoch).strftime('%Y-%m-%d %H:%M:%S')
+
+def create_presigned_download_url(object_name):
+    # Create a presigned url for downloading the results of an annotation job
+    # Reference: https://docs.aws.amazon.com/AmazonS3/latest/userguide/ShareObjectPreSignedURL.html
+    s3_client = boto3.client('s3', 
+                             region_name=app.config['AWS_REGION_NAME'],
+                             config=Config(signature_version='s3v4'))
+    bucket_name = app.config['AWS_S3_RESULTS_BUCKET']
+
+    try:
+        response = s3_client.generate_presigned_url('get_object',
+                                                    Params={'Bucket': bucket_name,
+                                                            'Key': object_name},
+                                                    ExpiresIn=app.config['AWS_SIGNED_REQUEST_EXPIRATION'])
+    except ClientError as e:
+        app.logger.error(f"Client Error when creating presigned url: {e}")
+        raise
+    except Exception as e:
+        app.logger.error(f"Error when creating presigned url: {e}")
+        raise
+    app.logger.info(f"Presigned download url: {response}")
+    # The response contains the presigned URL
+    return response
+
+# ------------------------- API ENDPOINTS ---------------------------- #
 """Start annotation request
 Create the required AWS S3 policy document and render a form for
 uploading an annotation input file using the policy document.
@@ -96,14 +158,38 @@ def create_annotation_job_request():
   # Get bucket name, key, and job ID from the S3 redirect URL
   bucket_name = str(request.args.get('bucket'))
   s3_key = str(request.args.get('key'))
+  print(f'bucket_name: {bucket_name}')
+  print(f's3_key: {s3_key}')
 
   # Extract the job ID from the S3 key
+  _, user, object_name = s3_key.split('/')
+  job_id, file_name = object_name.split('~')
+
+  # Get user profile
+  profile = get_profile(user)
 
   # Persist job to database
-  # Move your code here...
+  data = {'user_id':user, 
+          'job_id':job_id, 
+          'input_file_name':file_name,
+          's3_inputs_bucket':bucket_name, 
+          's3_key_input_file': s3_key,
+          'user_name':profile.name,
+          'user_email':profile.email,
+          'user_institution':profile.institution,
+          'user_role':profile.role}
+  try:
+    insert_dynamo(data)
+  except Exception as e:
+    app.logger.error(f"Unable to persist job to database: {e}") 
+  app.logger.info("Check point: insert_dynamo done")
 
   # Send message to request queue
-  # Move your code here...
+  try:
+    publish_to_sns(data)
+  except Exception as e:
+    app.logger.error(f"Unable to generate presigned URL for upload: {e}")
+  app.logger.info("Check point: publish_to_sns done")
 
   return render_template('annotate_confirm.html', job_id=job_id)
 
@@ -113,10 +199,27 @@ def create_annotation_job_request():
 @app.route('/annotations', methods=['GET'])
 @authenticated
 def annotations_list():
-
-  # Get list of annotations to display
+  user_id = session['primary_identity']
+  try:
+    dynamo = boto3.resource('dynamodb', region_name=app.config['AWS_REGION_NAME'])
+    table = dynamo.Table(app.config['AWS_DYNAMODB_ANNOTATIONS_TABLE'])
+    response = table.query(IndexName='user_id_index',
+                           KeyConditionExpression=Key('user_id').eq(user_id))
+  except ClientError as e:
+    app.logger.error(f"Unable to retrieve annotation jobs from database: {e}")
+    return abort(500)
+  except Exception as e:
+    app.logger.error(f"Unable to retrieve annotation jobs from database: {e}")
+    return abort(500)
   
-  return render_template('annotations.html', annotations=None)
+  # Get list of annotations to display
+  annotations = response['Items']
+  annotations.sort(key=lambda x: x['submit_time'], reverse=True)
+  # Convert submit_time from epoch to string for all annotations
+  for annotation in annotations:
+    annotation['submit_time'] = ephoch_to_readable_time(annotation['submit_time'])
+  app.logger.info(f"Retrieved {len(annotations)} annotations from database")
+  return render_template('annotations.html', annotations=annotations)
 
 
 """Display details of a specific annotation job
@@ -124,7 +227,26 @@ def annotations_list():
 @app.route('/annotations/<id>', methods=['GET'])
 @authenticated
 def annotation_details(id):
-  pass
+  try:
+    dynamo = boto3.resource('dynamodb', region_name=app.config['AWS_REGION_NAME'])
+    table = dynamo.Table(app.config['AWS_DYNAMODB_ANNOTATIONS_TABLE'])
+    response = table.get_item(Key={'job_id': id})
+  except ClientError as e:
+    app.logger.error(f"Unable to retrieve annotation job {id} from database: {e}")
+    return abort(500)
+  except Exception as e:
+    app.logger.error(f"Unable to retrieve annotation job {id} from database: {e}")
+    return abort(500)
+  annotation = response['Item']
+  annotation['submit_time'] = ephoch_to_readable_time(annotation['submit_time'])
+  # if the job is complete, convert the complete_time from epoch to string, generate presigned URL for result file
+  if 'complete_time' in annotation:
+    annotation['complete_time'] = ephoch_to_readable_time(annotation['complete_time'])  # convert complete_time from epoch to readable time
+    annotation['result_file_url'] = create_presigned_download_url(annotation['s3_key_result_file'])  # generate presigned URL for result file download
+  app.logger.info(f"Retrieved annotation job {id} from database")
+  if annotation['user_id'] != session['primary_identity']:
+    return abort(403)
+  return render_template('annotation_details.html', annotation=annotation)
 
 
 """Display the log file contents for an annotation job
@@ -132,7 +254,41 @@ def annotation_details(id):
 @app.route('/annotations/<id>/log', methods=['GET'])
 @authenticated
 def annotation_log(id):
-  pass
+  # Get the annotation job info from the DynamoDB table
+  try:
+    dynamo = boto3.resource('dynamodb', region_name=app.config['AWS_REGION_NAME'])
+    table = dynamo.Table(app.config['AWS_DYNAMODB_ANNOTATIONS_TABLE'])
+    response = table.get_item(Key={'job_id': id})
+  except ClientError as e:
+    app.logger.error(f"Unable to retrieve annotation job {id} from database: {e}")
+    return abort(500)
+  except Exception as e:
+    app.logger.error(f"Unable to retrieve annotation job {id} from database: {e}")
+    return abort(500)
+  annotation = response['Item']
+
+  # Verify that the user is authorized to view this log file
+  if annotation['user_id'] != session['primary_identity']:
+    return abort(403)
+  
+  bucket = app.config['AWS_S3_RESULTS_BUCKET']
+  log_file_key = annotation['s3_key_log_file']
+  
+  # Get the log file contents from S3
+  # Reference: https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/s3/client/get_object.html
+  try:
+    s3 = boto3.client('s3', region_name=app.config['AWS_REGION_NAME'])
+    response = s3.get_object(Bucket=bucket, Key=log_file_key)
+    log_file_contents = response['Body'].read().decode('utf-8')
+    app.logger.info(f"Retrieved log file for annotation job {id} from S3")
+  except ClientError as e:
+    app.logger.error(f"Unable to retrieve log file for annotation job {id} from S3: {e}")
+    return abort(500)
+  except Exception as e:
+    app.logger.error(f"Unable to retrieve log file for annotation job {id} from S3: {e}")
+    return abort(500)
+  
+  return render_template('view_log.html', log_file_contents=log_file_contents, job_id=id)
 
 
 """Subscription management handler
